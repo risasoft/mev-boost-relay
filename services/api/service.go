@@ -2,14 +2,11 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
-	"os"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,8 +32,6 @@ var (
 	ErrRelayPubkeyMismatch               = errors.New("relay pubkey does not match existing one")
 	ErrRegistrationWorkersAlreadyStarted = errors.New("validator registration workers already started")
 	ErrServerAlreadyStarted              = errors.New("server was already started")
-	ErrBeaconNodeSyncing                 = errors.New("beacon node is syncing")
-	ErrBeaconNodesUnavailable            = errors.New("all beacon nodes responded with error")
 )
 
 var (
@@ -62,10 +57,10 @@ type RelayAPIOpts struct {
 	BlockSimURL   string
 	RegValWorkers int // number of workers for validator registration processing
 
-	BeaconClients []beaconclient.BeaconNodeClient
-	Datastore     *datastore.Datastore
-	Redis         *datastore.RedisCache
-	DB            database.IDatabaseService
+	BeaconClient beaconclient.IMultiBeaconClient
+	Datastore    *datastore.Datastore
+	Redis        *datastore.RedisCache
+	DB           database.IDatabaseService
 
 	SecretKey *bls.SecretKey // used to sign bids (getHeader responses)
 
@@ -87,16 +82,12 @@ type RelayAPI struct {
 	srv        *http.Server
 	srvStarted uberatomic.Bool
 
-	regValEntriesC       chan types.SignedValidatorRegistration
-	regValWorkersStarted uberatomic.Bool
+	beaconClient beaconclient.IMultiBeaconClient
+	datastore    *datastore.Datastore
+	redis        *datastore.RedisCache
+	db           database.IDatabaseService
 
-	beaconClients []beaconclient.BeaconNodeClient
-	datastore     *datastore.Datastore
-	redis         *datastore.RedisCache
-	db            database.IDatabaseService
-
-	headSlot     uint64
-	currentEpoch uint64
+	headSlot uberatomic.Uint64
 
 	proposerDutiesLock       sync.RWMutex
 	proposerDutiesResponse   []types.BuilderGetValidatorsResponseEntry
@@ -104,12 +95,6 @@ type RelayAPI struct {
 	isUpdatingProposerDuties uberatomic.Bool
 
 	blockSimRateLimiter *BlockSimulationRateLimiter
-
-	// feature flags
-	ffAllowSyncingBeaconNode     bool
-	ffAllowZeroValueBlocks       bool
-	ffSyncValidatorRegistrations bool
-	ffAllowBlockVerificationFail bool
 }
 
 // NewRelayAPI creates a new service. if builders is nil, allow any builder
@@ -118,7 +103,7 @@ func NewRelayAPI(opts RelayAPIOpts) (*RelayAPI, error) {
 		return nil, ErrMissingLogOpt
 	}
 
-	if len(opts.BeaconClients) == 0 {
+	if opts.BeaconClient == nil {
 		return nil, ErrMissingBeaconClientOpt
 	}
 
@@ -134,11 +119,10 @@ func NewRelayAPI(opts RelayAPIOpts) (*RelayAPI, error) {
 		blsSk:                  opts.SecretKey,
 		publicKey:              &publicKey,
 		datastore:              opts.Datastore,
-		beaconClients:          opts.BeaconClients,
+		beaconClient:           opts.BeaconClient,
 		redis:                  opts.Redis,
 		db:                     opts.DB,
 		proposerDutiesResponse: []types.BuilderGetValidatorsResponseEntry{},
-		regValEntriesC:         make(chan types.SignedValidatorRegistration, 5000),
 		blockSimRateLimiter:    NewBlockSimulationRateLimiter(opts.BlockSimURL),
 	}
 
@@ -155,27 +139,6 @@ func NewRelayAPI(opts RelayAPIOpts) (*RelayAPI, error) {
 		}
 	} else if _pubkey != publicKey.String() {
 		return nil, fmt.Errorf("%w: new=%s old=%s", ErrRelayPubkeyMismatch, publicKey.String(), _pubkey)
-	}
-
-	// Feature Flags
-	if os.Getenv("ENABLE_ZERO_VALUE_BLOCKS") != "" {
-		api.log.Warn("env: ENABLE_ZERO_VALUE_BLOCKS: sending blocks with zero value")
-		api.ffAllowZeroValueBlocks = true
-	}
-
-	if os.Getenv("SYNC_VALIDATOR_REGISTRATIONS") != "" {
-		api.log.Warn("env: SYNC_VALIDATOR_REGISTRATIONS: enabling sync validator registrations")
-		api.ffSyncValidatorRegistrations = true
-	}
-
-	if os.Getenv("ALLOW_BLOCK_VERIFICATION_FAIL") != "" {
-		api.log.Warn("env: ALLOW_BLOCK_VERIFICATION_FAIL: allow failing block verification")
-		api.ffAllowBlockVerificationFail = true
-	}
-
-	if os.Getenv("ALLOW_SYNCING_BEACON_NODE") != "" {
-		api.log.Warn("env: ALLOW_SYNCING_BEACON_NODE: allow syncing beacon node")
-		api.ffAllowSyncingBeaconNode = true
 	}
 
 	return &api, nil
@@ -206,48 +169,6 @@ func (api *RelayAPI) getRouter() http.Handler {
 	return loggedRouter
 }
 
-// startValidatorRegistrationWorkers starts a number of worker goroutines to handle the expensive part
-// of (already sanity-checked) validator registrations: the signature verification and updating in Redis.
-func (api *RelayAPI) startValidatorRegistrationWorkers() error {
-	if api.regValWorkersStarted.Swap(true) {
-		return ErrRegistrationWorkersAlreadyStarted
-	}
-
-	numWorkers := api.opts.RegValWorkers
-	if numWorkers == 0 {
-		numWorkers = runtime.NumCPU()
-	}
-
-	api.log.Infof("Starting %d registerValidator workers", numWorkers)
-
-	for i := 0; i < numWorkers; i++ {
-		go func() {
-			for {
-				registration := <-api.regValEntriesC
-				log := api.log.WithFields(logrus.Fields{
-					"pubkey": registration.Message.Pubkey.PubkeyHex(),
-				})
-
-				// Verify the signature
-				ok, err := types.VerifySignature(registration.Message, api.opts.EthNetDetails.DomainBuilder, registration.Message.Pubkey[:], registration.Signature[:])
-				if err != nil || !ok {
-					log.WithError(err).Warn("failed to verify registerValidator signature")
-					continue
-				}
-
-				// Save the registration and increment counter
-				go func() {
-					err := api.datastore.SetValidatorRegistration(registration)
-					if err != nil {
-						log.WithError(err).Error("Failed to set validator registration")
-					}
-				}()
-			}
-		}()
-	}
-	return nil
-}
-
 // StartServer starts the HTTP server for this instance
 func (api *RelayAPI) StartServer() (err error) {
 	if api.srvStarted.Swap(true) {
@@ -255,13 +176,7 @@ func (api *RelayAPI) StartServer() (err error) {
 	}
 
 	// Get best beacon-node status by head slot, process current slot and start slot updates
-	bestSyncStatus, err := api.getBestSyncStatus()
-	if err != nil {
-		return err
-	}
-
-	// Start worker pool for validator registration processing
-	err = api.startValidatorRegistrationWorkers()
+	bestSyncStatus, err := api.beaconClient.BestSyncStatus()
 	if err != nil {
 		return err
 	}
@@ -278,9 +193,7 @@ func (api *RelayAPI) StartServer() (err error) {
 	// Start regular slot updates
 	go func() {
 		c := make(chan beaconclient.HeadEventData)
-		for _, client := range api.beaconClients {
-			go client.SubscribeToHeadEvents(c)
-		}
+		api.beaconClient.SubscribeToHeadEvents(c)
 		for {
 			headEvent := <-c
 			api.processNewSlot(headEvent.Slot)
@@ -291,7 +204,7 @@ func (api *RelayAPI) StartServer() (err error) {
 	go func() {
 		for {
 			time.Sleep(2 * time.Minute)
-			numRemoved, numRemaining := api.datastore.CleanupOldBidsAndBlocks(api.headSlot)
+			numRemoved, numRemaining := api.datastore.CleanupOldBidsAndBlocks(api.headSlot.Load())
 			api.log.Infof("Removed %d old bids and blocks. Remaining: %d", numRemoved, numRemaining)
 		}
 	}()
@@ -313,78 +226,24 @@ func (api *RelayAPI) StartServer() (err error) {
 	return err
 }
 
-func (api *RelayAPI) getBestSyncStatus() (*beaconclient.SyncStatusPayloadData, error) {
-	var bestSyncStatus *beaconclient.SyncStatusPayloadData
-	var numSyncedNodes uint32
-	requestCtx, requestCtxCancel := context.WithCancel(context.Background())
-	defer requestCtxCancel()
-
-	// Check each beacon-node sync status
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for _, client := range api.beaconClients {
-		wg.Add(1)
-		go func(client beaconclient.BeaconNodeClient) {
-			defer wg.Done()
-			log := api.log.WithField("uri", client.GetURI())
-			log.Debug("getting sync status")
-
-			syncStatus, err := client.SyncStatus()
-			if err != nil {
-				log.WithError(err).Error("failed to get sync status")
-				return
-			}
-
-			mu.Lock()
-			defer mu.Unlock()
-
-			if requestCtx.Err() != nil { // request has been cancelled (or deadline exceeded)
-				return
-			}
-
-			if bestSyncStatus == nil {
-				bestSyncStatus = syncStatus
-			}
-
-			if !syncStatus.IsSyncing {
-				bestSyncStatus = syncStatus
-				numSyncedNodes++
-				requestCtxCancel()
-			}
-		}(client)
-	}
-
-	// Wait for all requests to complete...
-	wg.Wait()
-
-	if numSyncedNodes == 0 && !api.ffAllowSyncingBeaconNode {
-		return nil, ErrBeaconNodeSyncing
-	}
-
-	if bestSyncStatus == nil {
-		return nil, ErrBeaconNodesUnavailable
-	}
-
-	return bestSyncStatus, nil
-}
-
 func (api *RelayAPI) processNewSlot(headSlot uint64) {
-	if headSlot <= api.headSlot {
+	_apiHeadSlot := api.headSlot.Load()
+	if headSlot <= _apiHeadSlot {
 		return
 	}
 
-	if api.headSlot > 0 {
-		for s := api.headSlot + 1; s < headSlot; s++ {
+	if _apiHeadSlot > 0 {
+		for s := _apiHeadSlot + 1; s < headSlot; s++ {
 			api.log.WithField("missedSlot", s).Warnf("missed slot: %d", s)
 		}
 	}
 
-	api.headSlot = headSlot
-	api.currentEpoch = headSlot / uint64(common.SlotsPerEpoch)
+	api.headSlot.Store(headSlot)
+	epoch := headSlot / uint64(common.SlotsPerEpoch)
 	api.log.WithFields(logrus.Fields{
-		"epoch":              api.currentEpoch,
+		"epoch":              epoch,
 		"slotHead":           headSlot,
-		"slotStartNextEpoch": (api.currentEpoch + 1) * uint64(common.SlotsPerEpoch),
+		"slotStartNextEpoch": (epoch + 1) * uint64(common.SlotsPerEpoch),
 	}).Infof("updated headSlot to %d", headSlot)
 
 	// Regularly update proposer duties in the background
@@ -529,27 +388,23 @@ func (api *RelayAPI) handleRegisterValidator(w http.ResponseWriter, req *http.Re
 
 		// Send to workers for signature verification and saving
 		numRegNew++
-		if api.ffSyncValidatorRegistrations {
-			// Verify the signature
-			ok, err := types.VerifySignature(registration.Message, api.opts.EthNetDetails.DomainBuilder, registration.Message.Pubkey[:], registration.Signature[:])
-			if err != nil {
-				regLog.WithError(err).Error("error verifying registerValidator signature")
-				continue
-			} else if !ok {
-				api.RespondError(w, http.StatusBadRequest, fmt.Sprintf("failed to verify validator signature for %s", registration.Message.Pubkey.String()))
-				return
-			} else {
-				// Save and increment counter
-				go func(reg types.SignedValidatorRegistration) {
-					err := api.datastore.SetValidatorRegistration(reg)
-					if err != nil {
-						regLog.WithError(err).Error("Failed to set validator registration")
-					}
-				}(registration)
-			}
+
+		// Verify the signature
+		ok, err := types.VerifySignature(registration.Message, api.opts.EthNetDetails.DomainBuilder, registration.Message.Pubkey[:], registration.Signature[:])
+		if err != nil {
+			regLog.WithError(err).Error("error verifying registerValidator signature")
+			continue
+		} else if !ok {
+			api.RespondError(w, http.StatusBadRequest, fmt.Sprintf("failed to verify validator signature for %s", registration.Message.Pubkey.String()))
+			return
 		} else {
-			// Send to channel for async processing
-			api.regValEntriesC <- registration
+			// Save and increment counter
+			go func(reg types.SignedValidatorRegistration) {
+				err := api.datastore.SetValidatorRegistration(reg)
+				if err != nil {
+					regLog.WithError(err).Error("Failed to set validator registration")
+				}
+			}(registration)
 		}
 	}
 
@@ -602,8 +457,8 @@ func (api *RelayAPI) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// If 0-value bid, only return if explicitly allowed
-	if bid.Data.Message.Value.Cmp(&ZeroU256) == 0 && !api.ffAllowZeroValueBlocks {
+	// Error on bid without value
+	if bid.Data.Message.Value.Cmp(&ZeroU256) == 0 {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -715,12 +570,15 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 		"blockHash": payload.Message.BlockHash.String(),
 	})
 
-	// By default, don't accept blocks with 0 value
-	if !api.ffAllowZeroValueBlocks {
-		if payload.Message.Value.Cmp(&ZeroU256) == 0 || len(payload.ExecutionPayload.Transactions) == 0 {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+	if payload.Message.Slot <= api.headSlot.Load() {
+		api.RespondError(w, http.StatusBadRequest, "submission for past slot")
+		return
+	}
+
+	// Don't accept blocks with 0 value
+	if payload.Message.Value.Cmp(&ZeroU256) == 0 || len(payload.ExecutionPayload.Transactions) == 0 {
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 
 	// Sanity check the submission
@@ -754,7 +612,7 @@ func (api *RelayAPI) handleSubmitNewBlock(w http.ResponseWriter, req *http.Reque
 	}()
 
 	// Return error if block verification failed
-	if simErr != nil && !api.ffAllowBlockVerificationFail {
+	if simErr != nil {
 		api.RespondError(w, http.StatusBadRequest, simErr.Error())
 		return
 	}
